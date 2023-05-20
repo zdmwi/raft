@@ -17,43 +17,61 @@ case class RaftClient(cluster: Seq[(ID, ActorRef[RaftEvent])]) {
   // randomly choose a node from the cluster as the leader
   private var leaderAddr: ActorRef[RaftEvent] = Random.shuffle(cluster).head._2
 
-  private var rpc: Option[RaftEvent] = None
+  private var clientId: Option[ID] = None
+
+  private var request: Option[RaftEvent] = None
+
+  private var sequenceNum = 0L
 
   def apply(): Behavior[String | RaftEvent | ClientEvent] = Behaviors.setup { context =>
     context.log.info("Client was created")
 
     context.log.info("Registering with the Raft cluster...")
     // Client must register with the cluster
-    rpc = Some(RegisterClientRPC(context.self))
-    leaderAddr ! rpc.get
+    request = Some(RegisterClientRPC(context.self))
+    leaderAddr ! request.get
 
     Behaviors.withTimers { timers =>
 
       val delay = 1
-      timers.startSingleTimer(ResponseTimeout(rpc), delay.seconds)
+      timers.startTimerWithFixedDelay(ResponseTimeout(request), delay.seconds)
 
       Behaviors.receive { (context, msg) =>
         msg match {
           case cmd: String =>
-            // parse the command and forward it to the cluster
-            leaderAddr ! NoOp()
+            if clientId.isDefined then
+              context.log.info(s"$tag: Sending request...")
+              // parse the command and forward it to the cluster
+              request = Some(ClientRequestRPC(clientId.get, sequenceNum, NoOp(), context.self))
+              leaderAddr ! request.get
+              timers.startTimerWithFixedDelay(ResponseTimeout(request), delay.seconds)
+            Behaviors.same
+          case rpc: ClientRequestResponseRPC =>
+            if rpc.status == ClientRPCStatus.OK then
+              timers.cancelAll()
+              leaderAddr = rpc.leaderHint.get
+              request = None
             Behaviors.same
           case rpc: RegisterClientResponseRPC =>
             if rpc.status == ClientRPCStatus.NOT_LEADER then
               if rpc.leaderHint.isEmpty then
-              // randomly select another node
                 leaderAddr = Random.shuffle(cluster).head._2
               else
-              // use the hint we got from the response
                 leaderAddr = rpc.leaderHint.get
-              context.log.info(s"$tag: Retrying RegisterClientRPC")
             else if rpc.status == ClientRPCStatus.OK then
               timers.cancelAll()
+              clientId = Some(rpc.clientId)
+              leaderAddr = rpc.leaderHint.get
+              request = None
               context.log.info(s"$tag: Registered successfully")
             Behaviors.same
           case _: ResponseTimeout =>
             // retry the rpc sent before
-            leaderAddr ! rpc.get
+            context.log.info(s"$tag: Retrying request ${request.get}...")
+            // try another random node
+            val clusterWithoutUnresponsiveNode = cluster.filter(_._2 != leaderAddr)
+            leaderAddr = Random.shuffle(clusterWithoutUnresponsiveNode).head._2
+            leaderAddr ! request.get
             Behaviors.same
           case _: RaftEvent =>
             Behaviors.same

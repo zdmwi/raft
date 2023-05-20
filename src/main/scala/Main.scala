@@ -5,14 +5,14 @@ import scala.io.StdIn.readLine
 
 object Main {
   def main(args: Array[String]): Unit = {
-    val numNodes = 3
+    val numNodes = 5
     val cluster = for (i <- 0 until numNodes) yield (i, ActorSystem(RaftNode(i)(), s"N$i"))
 
     cluster.foreach { (id, node) =>
       node ! Init(cluster.filter(_._1 != id))
     }
 
-    val client = ActorSystem(RaftClient(cluster)(), "Client")
+    val client = ActorSystem(RaftClient(cluster)(), "C")
 
     var done = false
     while !done do
