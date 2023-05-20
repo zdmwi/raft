@@ -40,26 +40,41 @@ case class RaftClient(cluster: Seq[(ID, ActorRef[RaftEvent])]) {
       Behaviors.receive { (context, msg) =>
         msg match {
           case cmd: String =>
+            // parse the values
+            val params = cmd.split(" ")
+            val key = params.lift(1)
+            val value = params.lift(2)
+
             var op: RaftCommand = NoOp()
             if clientId.isDefined then
               context.log.info(s"$tag: Sending request...")
               // parse the command and forward it to the cluster
               if cmd.startsWith("read") then
-                context.log.info(s"$tag: Requesting read of key...")
-//                request = Some(ClientQueryRPC())
+                context.log.info(s"$tag: Requesting read of key $key...")
+                request = Some(ClientQueryRPC(ReadOp(key.get), context.self))
               else
                 if cmd.startsWith("create") then
-                  op = CreateOp(sequenceNum, clientId.get)
+                  op = CreateOp(key.get, value.get, sequenceNum, clientId.get)
                 else if cmd.startsWith("delete") then
-                  op = DeleteOp(sequenceNum, clientId.get)
+                  op = DeleteOp(key.get, sequenceNum, clientId.get)
                 else if cmd.startsWith("update") then
-                  op = UpdateOp(sequenceNum, clientId.get)
+                  op = UpdateOp(key.get, value.get, sequenceNum, clientId.get)
                 else
                   op = NoOp()
                 request = Some(ClientRequestRPC(clientId.get, sequenceNum, op, context.self))
 
               leaderAddr ! request.get
               timers.startTimerWithFixedDelay(ResponseTimeout(request), delay.seconds)
+            Behaviors.same
+          case rpc: ClientQueryResponseRPC =>
+            if rpc.status == ClientRPCStatus.OK then
+              context.log.info(s"$tag: Received read response: ${rpc.response}")
+              timers.cancelAll()
+              leaderHint = rpc.leaderHint
+              request = None
+            else if rpc.status == ClientRPCStatus.NOT_LEADER then
+              if rpc.leaderHint.isDefined then
+                leaderHint = rpc.leaderHint
             Behaviors.same
           case rpc: ClientRequestResponseRPC =>
             if rpc.status == ClientRPCStatus.OK then

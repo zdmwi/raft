@@ -55,22 +55,51 @@ object RaftNode {
 
   case class ClientRequestResponseRPC(status: ClientRPCStatus, response: Any, leaderHint: Option[ActorRef[RaftEvent]]) extends ClientRPC
 
-  case class ClientQueryRPC() extends ClientRPC
+  case class ClientQueryRPC(query: RaftCommand, replyTo: ActorRef[RaftEvent]) extends ClientRPC
+
+  case class ClientQueryResponseRPC(status: ClientRPCStatus, response: Any, leaderHint: Option[ActorRef[RaftEvent]]) extends ClientRPC
 
   trait RaftCommand extends RaftEvent
 }
 
 case class RaftNode(id: ID) {
-
   import RaftNode.*
+
+  val currentTermFilename = s"N$id-ct.raft"
+  val votedForFilename = s"N$id-vf.raft"
+  val logFilename = s"N$id-log.raft"
 
   private val tag = s"[Node $id]"
   private var nodes = List.empty[(ID, ActorRef[RaftEvent])]
 
   // Persistent state
-  private var currentTerm: Term = 0L // initialized to 0 on first boot
-  private var votedFor: Option[ID] = None // initialized to None
-  private var log: List[LogEntry] = List.empty // Maybe include a NoOp so the first index is 1 ?
+  private var currentTerm: Term = {
+    val currentTermOnDisk = Serializer.deserialize[Term](currentTermFilename)
+    currentTermOnDisk match {
+      case Some(term) =>
+        term
+      case None =>
+        0L
+    }
+  }  // initialized to 0 on first boot
+  private var votedFor: Option[ID] = {
+    val votedForOnDisk = Serializer.deserialize[Option[ID]](votedForFilename)
+    votedForOnDisk match {
+      case Some(vf) =>
+        vf
+      case None =>
+        None
+    }
+  } // initialized to None
+  private var log: List[LogEntry] = {
+    val logOnDisk = Serializer.deserialize[List[LogEntry]](logFilename)
+    logOnDisk match {
+      case Some(lg) =>
+        lg
+      case None =>
+        List.empty[LogEntry]
+    }
+  }
 
   // Volatile state
   private var commitIndex = 0
@@ -89,6 +118,18 @@ case class RaftNode(id: ID) {
 
     None
   }
+
+  private def updateLog(newLog: List[LogEntry]) =
+    log = newLog
+    Serializer.serialize(log, logFilename)
+
+  private def updateCurrentTerm(newTerm: Term) =
+    currentTerm = newTerm
+    Serializer.serialize(currentTerm, currentTermFilename)
+
+  private def updateVotedFor(newVotedFor: Option[ID]) =
+    votedFor = newVotedFor
+    Serializer.serialize(votedFor, votedForFilename)
 
   def apply(): Behavior[RaftEvent] = Behaviors.setup { _ =>
     Behaviors.receive { (context, msg) =>
@@ -123,11 +164,16 @@ case class RaftNode(id: ID) {
             context.log.info(s"$tag: Received request from client. Redirecting to leader...")
             rpc.replyTo ! ClientRequestResponseRPC(ClientRPCStatus.NOT_LEADER, -1, leaderHint)
             Behaviors.same
+          case rpc: ClientQueryRPC =>
+            // redirect them to who we think the leader is
+            context.log.info(s"$tag: Received request from client. Redirecting to leader...")
+            rpc.replyTo ! ClientQueryResponseRPC(ClientRPCStatus.NOT_LEADER, -1, leaderHint)
+            Behaviors.same
           case rpc: RequestVoteRPC =>
             if rpc.term > currentTerm then
               context.log.info(s"$tag: Out of date. Updating term...")
-              currentTerm = rpc.term
-              votedFor = None
+              updateCurrentTerm(rpc.term)
+              updateVotedFor(None)
 
             val isNullOrCandidateId = votedFor.isEmpty || (votedFor.get == rpc.candidateId)
 
@@ -158,7 +204,7 @@ case class RaftNode(id: ID) {
               // grant our vote and reset election timeout
               context.log.info(s"$tag: Voted for [Node ${rpc.candidateId}]")
               rpc.replyTo ! RequestVoteResponseRPC(currentTerm, voteGranted = true)
-              votedFor = Some(rpc.candidateId)
+              updateVotedFor(Some(rpc.candidateId))
 
               val timeout = Random.between(ElectionTimeoutRange.START, ElectionTimeoutRange.END)
               timers.startSingleTimer(ElectionTimeout(), timeout.milliseconds)
@@ -166,8 +212,8 @@ case class RaftNode(id: ID) {
           case rpc: AppendEntriesRPC =>
             if rpc.term > currentTerm then
               context.log.info(s"$tag: Out of date. Updating term...")
-              currentTerm = rpc.term
-              votedFor = None // new term so reset who we voted for
+              updateCurrentTerm(rpc.term)
+              updateVotedFor(None) // new term so we reset who we voted for
               leaderHint = Some(rpc.replyTo)
               Behaviors.same // remain as a follower
             else if rpc.term < currentTerm then
@@ -191,7 +237,7 @@ case class RaftNode(id: ID) {
 
                   if log.isDefinedAt(realIdx) && log(realIdx)._1 != entry._1 then
                     context.log.info(s"$tag: Log entries do not match. Reconciling...")
-                    log = log.take(realIdx)
+                    updateLog(log.take(realIdx))
                 }
 
                 // append any new entries not already in the log
@@ -200,7 +246,7 @@ case class RaftNode(id: ID) {
 
                   if !log.isDefinedAt(realIdx) then
                     context.log.info(s"$tag: Appending $entry to log...")
-                    log = log.appended(entry)
+                    updateLog(log.appended(entry))
                     context.log.info(s"$tag: Log $log")
                 }
 
@@ -234,11 +280,11 @@ case class RaftNode(id: ID) {
   private def becomeCandidate(): Behavior[RaftEvent] = Behaviors.setup { context =>
     context.log.info(s"$tag: Became candidate")
     // increment the current term
-    currentTerm += 1
+    updateCurrentTerm(currentTerm + 1)
 
     // vote for ourself
     var votes = 1
-    votedFor = Some(id)
+    updateVotedFor(Some(id))
     leaderHint = None
 
     Behaviors.withTimers { timers =>
@@ -266,6 +312,11 @@ case class RaftNode(id: ID) {
             context.log.info(s"$tag: Received request from client. Redirecting to leader...")
             rpc.replyTo ! ClientRequestResponseRPC(ClientRPCStatus.NOT_LEADER, -1, leaderHint)
             Behaviors.same
+          case rpc: ClientQueryRPC =>
+            // redirect them to who we think the leader is
+            context.log.info(s"$tag: Received request from client. Redirecting to leader...")
+            rpc.replyTo ! ClientQueryResponseRPC(ClientRPCStatus.NOT_LEADER, -1, leaderHint)
+            Behaviors.same
           case rpc: AppendEntriesRPC =>
             tryApplyCommit(context)
 
@@ -274,8 +325,8 @@ case class RaftNode(id: ID) {
               leaderHint = Some(rpc.replyTo)
 
               if rpc.term > currentTerm then
-                currentTerm = rpc.term
-                votedFor = None
+                updateCurrentTerm(rpc.term)
+                updateVotedFor(None)
 
               timers.cancelAll()
               becomeFollower()
@@ -288,8 +339,8 @@ case class RaftNode(id: ID) {
 
             // check if the term is out of date
             if rpc.term > currentTerm then
-              currentTerm = rpc.term
-              votedFor = None
+              updateCurrentTerm(rpc.term)
+              updateVotedFor(None)
               becomeFollower()
             else
               // reply false since a candidate will only ever vote for itself
@@ -300,8 +351,8 @@ case class RaftNode(id: ID) {
 
             // check if the term is out of date
             if rpc.term > currentTerm then
-              currentTerm = rpc.term
-              votedFor = None
+              updateCurrentTerm(rpc.term)
+              updateVotedFor(None)
               becomeFollower()
             else
               if rpc.voteGranted then
@@ -353,7 +404,7 @@ case class RaftNode(id: ID) {
 
     // client interaction requirement, upon becoming leader append NoOp entry to log
     context.log.info(s"$tag: Appending NoOp to log...")
-    log = log.appended((currentTerm, NoOp()))
+    updateLog(log.appended((currentTerm, NoOp())))
     context.log.info(s"$tag: Log is $log")
 
     // track state of replications so far while we need to commit
@@ -414,7 +465,7 @@ case class RaftNode(id: ID) {
             val clientID = log.length - 1
             val command = RegisterOp(rpc.sequenceNum, 0)
             context.log.info(s"$tag: Received $rpc from client. Appending $command to log...")
-            log = log.appended((currentTerm, command))
+            updateLog(log.appended((currentTerm, command)))
             context.log.info(s"$tag: Log $log")
             needsToCommit = true
 
@@ -424,7 +475,7 @@ case class RaftNode(id: ID) {
             Behaviors.same
           case rpc: ClientRequestRPC =>
             context.log.info(s"$tag: Received $rpc from client. Appending ${rpc.command} to log...")
-            log = log.appended((currentTerm, rpc.command))
+            updateLog(log.appended((currentTerm, rpc.command)))
             context.log.info(s"$tag: Log $log")
             needsToCommit = true
 
@@ -432,13 +483,23 @@ case class RaftNode(id: ID) {
             pendingResponseRPC = Some((rpc.replyTo, res))
 
             Behaviors.same
+          case rpc: ClientQueryRPC =>
+            context.log.info(s"$tag: Received $rpc from client. Reading from application...")
+
+            // TODO: implement the receiver steps how it was specified in ClientRPC. For now we assume that we
+            // are always up to date (though this is wrong)
+
+            val result = stateMachine.applyIfNotProcessed(tag, context, rpc.query)
+            rpc.replyTo !  ClientQueryResponseRPC(ClientRPCStatus.OK, result, leaderHint)
+
+            Behaviors.same
           case rpc: RequestVoteRPC =>
             tryApplyCommit(context)
             tryUpdateCommitIndex(context)
 
             if rpc.term > currentTerm then
-              currentTerm = rpc.term
-              votedFor = None
+              updateCurrentTerm(rpc.term)
+              updateVotedFor(None)
               timers.cancelAll()
               becomeFollower()
             else
@@ -451,8 +512,8 @@ case class RaftNode(id: ID) {
 
             if rpc.term > currentTerm then
               context.log.info(s"$tag: Out of date. Updating currentTerm and reverting to a follower...")
-              currentTerm = rpc.term
-              votedFor = None
+              updateCurrentTerm(rpc.term)
+              updateVotedFor(None)
               timers.cancelAll()
               becomeFollower()
             else

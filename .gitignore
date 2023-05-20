@@ -33,3 +33,4 @@ metals.sbt
 
 # data files
 *.data
+*.raft
