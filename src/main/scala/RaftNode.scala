@@ -8,7 +8,7 @@ import scala.util.control.Breaks
 
 
 enum ClientRPCStatus:
-  case OK, NOT_LEADER, SESSION_EXPIRED
+  case OK, NOT_LEADER
 
 object ElectionTimeoutRange {
   val START = 150
@@ -47,21 +47,22 @@ object RaftNode {
   // Client interaction RPCs
   sealed trait ClientRPC extends RPC
 
-  case class RegisterClientRPC(replyTo: ActorRef[RaftEvent]) extends ClientRPC
+  case class RegisterClientRPC(sequenceNum: Long, replyTo: ActorRef[RaftEvent]) extends ClientRPC
 
   case class RegisterClientResponseRPC(status: ClientRPCStatus, clientId: ID, leaderHint: Option[ActorRef[RaftEvent]]) extends ClientRPC
 
-  case class ClientRequestRPC(clientID: ID, sequenceNum: Long, command: RaftCommand, replyTo: ActorRef[RaftEvent]) extends ClientRPC
+  case class ClientRequestRPC(clientId: ID, sequenceNum: Long, command: RaftCommand, replyTo: ActorRef[RaftEvent]) extends ClientRPC
 
   case class ClientRequestResponseRPC(status: ClientRPCStatus, response: Any, leaderHint: Option[ActorRef[RaftEvent]]) extends ClientRPC
 
+  case class ClientQueryRPC() extends ClientRPC
 
   trait RaftCommand extends RaftEvent
 }
 
 case class RaftNode(id: ID) {
 
-  import RaftNode._
+  import RaftNode.*
 
   private val tag = s"[Node $id]"
   private var nodes = List.empty[(ID, ActorRef[RaftEvent])]
@@ -79,13 +80,12 @@ case class RaftNode(id: ID) {
 
   private val stateMachine = StateMachine()
 
-
   private def tryApplyCommit(context: ActorContext[RaftEvent]): Option[Any] = {
     if commitIndex > lastApplied then
       lastApplied += 1
       val command = log(lastApplied - 1)._2
       context.log.info(s"$tag: Applying command $command to state machine...")
-      return stateMachine.apply(command)
+      return stateMachine.applyIfNotProcessed(tag, context, command)
 
     None
   }
@@ -360,8 +360,6 @@ case class RaftNode(id: ID) {
     needsToCommit = true
     replicatedCount += 1
 
-    // register operation book keeping
-
     def tryUpdateCommitIndex(context: ActorContext[RaftEvent]): Unit = {
       var N = -1
       val breakCtl = Breaks()
@@ -414,7 +412,7 @@ case class RaftNode(id: ID) {
         msg match {
           case rpc: RegisterClientRPC =>
             val clientID = log.length - 1
-            val command = RegisterOp(clientID)
+            val command = RegisterOp(rpc.sequenceNum, 0)
             context.log.info(s"$tag: Received $rpc from client. Appending $command to log...")
             log = log.appended((currentTerm, command))
             context.log.info(s"$tag: Log $log")
@@ -430,11 +428,7 @@ case class RaftNode(id: ID) {
             context.log.info(s"$tag: Log $log")
             needsToCommit = true
 
-            var status = ClientRPCStatus.OK
-            if !stateMachine.hasSession(rpc.clientID) then
-              status = ClientRPCStatus.SESSION_EXPIRED
-
-            val res = ClientRequestResponseRPC(status, None, leaderHint)
+            val res = ClientRequestResponseRPC(ClientRPCStatus.OK, None, leaderHint)
             pendingResponseRPC = Some((rpc.replyTo, res))
 
             Behaviors.same

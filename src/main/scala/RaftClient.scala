@@ -1,4 +1,4 @@
-import RaftNode.{ID, RaftEvent }
+import RaftNode.{ID, RaftEvent}
 import akka.actor.typed.scaladsl.Behaviors
 import akka.actor.typed.{ActorRef, Behavior}
 
@@ -10,8 +10,8 @@ object RaftClient {
   private case class ResponseTimeout(rpc: Any) extends ClientEvent
 }
 case class RaftClient(cluster: Seq[(ID, ActorRef[RaftEvent])]) {
-  import RaftClient._
-  import RaftNode._
+  import RaftClient.*
+  import RaftNode.*
 
   private val tag = "[Client]"
   // randomly choose a node from the cluster as the leader
@@ -29,7 +29,7 @@ case class RaftClient(cluster: Seq[(ID, ActorRef[RaftEvent])]) {
 
     context.log.info("Registering with the Raft cluster...")
     // Client must register with the cluster
-    request = Some(RegisterClientRPC(context.self))
+    request = Some(RegisterClientRPC(sequenceNum, context.self)) // if just registering sequence num must always be 0
     leaderAddr ! request.get
 
     Behaviors.withTimers { timers =>
@@ -40,10 +40,24 @@ case class RaftClient(cluster: Seq[(ID, ActorRef[RaftEvent])]) {
       Behaviors.receive { (context, msg) =>
         msg match {
           case cmd: String =>
+            var op: RaftCommand = NoOp()
             if clientId.isDefined then
               context.log.info(s"$tag: Sending request...")
               // parse the command and forward it to the cluster
-              request = Some(ClientRequestRPC(clientId.get, sequenceNum, NoOp(), context.self))
+              if cmd.startsWith("read") then
+                context.log.info(s"$tag: Requesting read of key...")
+//                request = Some(ClientQueryRPC())
+              else
+                if cmd.startsWith("create") then
+                  op = CreateOp(sequenceNum, clientId.get)
+                else if cmd.startsWith("delete") then
+                  op = DeleteOp(sequenceNum, clientId.get)
+                else if cmd.startsWith("update") then
+                  op = UpdateOp(sequenceNum, clientId.get)
+                else
+                  op = NoOp()
+                request = Some(ClientRequestRPC(clientId.get, sequenceNum, op, context.self))
+
               leaderAddr ! request.get
               timers.startTimerWithFixedDelay(ResponseTimeout(request), delay.seconds)
             Behaviors.same
@@ -52,6 +66,7 @@ case class RaftClient(cluster: Seq[(ID, ActorRef[RaftEvent])]) {
               timers.cancelAll()
               leaderHint = rpc.leaderHint
               request = None
+              sequenceNum += 1
             Behaviors.same
           case rpc: RegisterClientResponseRPC =>
             if rpc.status == ClientRPCStatus.NOT_LEADER then
@@ -62,6 +77,7 @@ case class RaftClient(cluster: Seq[(ID, ActorRef[RaftEvent])]) {
               clientId = Some(rpc.clientId)
               leaderAddr = rpc.leaderHint.get
               request = None
+              sequenceNum += 1
               context.log.info(s"$tag: Registered successfully")
             Behaviors.same
           case _: ResponseTimeout =>
