@@ -74,7 +74,7 @@ case class RaftNode(id: ID) {
 
   // Persistent state
   private var currentTerm: Term = {
-    val currentTermOnDisk = Serializer.deserialize[Term](currentTermFilename)
+    val currentTermOnDisk = StorageManager.deserialize[Term](currentTermFilename)
     currentTermOnDisk match {
       case Some(term) =>
         term
@@ -83,7 +83,7 @@ case class RaftNode(id: ID) {
     }
   }  // initialized to 0 on first boot
   private var votedFor: Option[ID] = {
-    val votedForOnDisk = Serializer.deserialize[Option[ID]](votedForFilename)
+    val votedForOnDisk = StorageManager.deserialize[Option[ID]](votedForFilename)
     votedForOnDisk match {
       case Some(vf) =>
         vf
@@ -92,7 +92,7 @@ case class RaftNode(id: ID) {
     }
   } // initialized to None
   private var log: List[LogEntry] = {
-    val logOnDisk = Serializer.deserialize[List[LogEntry]](logFilename)
+    val logOnDisk = StorageManager.deserialize[List[LogEntry]](logFilename)
     logOnDisk match {
       case Some(lg) =>
         lg
@@ -107,9 +107,9 @@ case class RaftNode(id: ID) {
 
   private var leaderHint: Option[ActorRef[RaftEvent]] = None
 
-  private val stateMachine = StateMachine()
+  private val stateMachine = StateMachine(id)
 
-  private def tryApplyCommit(context: ActorContext[RaftEvent]): Option[Any] = {
+  private def tryApplyCommit(context: ActorContext[RaftEvent]): Option[String | Any] = {
     if commitIndex > lastApplied then
       lastApplied += 1
       val command = log(lastApplied - 1)._2
@@ -121,15 +121,15 @@ case class RaftNode(id: ID) {
 
   private def updateLog(newLog: List[LogEntry]) =
     log = newLog
-    Serializer.serialize(log, logFilename)
+    StorageManager.serialize(log, logFilename)
 
   private def updateCurrentTerm(newTerm: Term) =
     currentTerm = newTerm
-    Serializer.serialize(currentTerm, currentTermFilename)
+    StorageManager.serialize(currentTerm, currentTermFilename)
 
   private def updateVotedFor(newVotedFor: Option[ID]) =
     votedFor = newVotedFor
-    Serializer.serialize(votedFor, votedForFilename)
+    StorageManager.serialize(votedFor, votedForFilename)
 
   def apply(): Behavior[RaftEvent] = Behaviors.setup { _ =>
     Behaviors.receive { (context, msg) =>
