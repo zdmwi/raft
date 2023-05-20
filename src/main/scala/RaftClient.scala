@@ -15,6 +15,7 @@ case class RaftClient(cluster: Seq[(ID, ActorRef[RaftEvent])]) {
 
   private val tag = "[Client]"
   // randomly choose a node from the cluster as the leader
+  private var leaderHint: Option[ActorRef[RaftEvent]] = None
   private var leaderAddr: ActorRef[RaftEvent] = Random.shuffle(cluster).head._2
 
   private var clientId: Option[ID] = None
@@ -49,15 +50,13 @@ case class RaftClient(cluster: Seq[(ID, ActorRef[RaftEvent])]) {
           case rpc: ClientRequestResponseRPC =>
             if rpc.status == ClientRPCStatus.OK then
               timers.cancelAll()
-              leaderAddr = rpc.leaderHint.get
+              leaderHint = rpc.leaderHint
               request = None
             Behaviors.same
           case rpc: RegisterClientResponseRPC =>
             if rpc.status == ClientRPCStatus.NOT_LEADER then
-              if rpc.leaderHint.isEmpty then
-                leaderAddr = Random.shuffle(cluster).head._2
-              else
-                leaderAddr = rpc.leaderHint.get
+              if rpc.leaderHint.isDefined then
+                leaderHint = rpc.leaderHint
             else if rpc.status == ClientRPCStatus.OK then
               timers.cancelAll()
               clientId = Some(rpc.clientId)
@@ -67,10 +66,15 @@ case class RaftClient(cluster: Seq[(ID, ActorRef[RaftEvent])]) {
             Behaviors.same
           case _: ResponseTimeout =>
             // retry the rpc sent before
-            context.log.info(s"$tag: Retrying request ${request.get}...")
-            // try another random node
-            val clusterWithoutUnresponsiveNode = cluster.filter(_._2 != leaderAddr)
-            leaderAddr = Random.shuffle(clusterWithoutUnresponsiveNode).head._2
+            // try another random node if we don't have a hint
+            if leaderHint.isEmpty then
+              val clusterWithoutUnresponsiveNode = cluster.filter(_._2 != leaderAddr)
+              leaderAddr = Random.shuffle(clusterWithoutUnresponsiveNode).head._2
+            else
+              leaderAddr = leaderHint.get
+              leaderHint = None
+
+            context.log.info(s"$tag: Retrying request ${request.get} to $leaderAddr...")
             leaderAddr ! request.get
             Behaviors.same
           case _: RaftEvent =>

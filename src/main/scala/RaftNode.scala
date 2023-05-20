@@ -180,39 +180,43 @@ case class RaftNode(id: ID) {
               val timeout = Random.between(ElectionTimeoutRange.START, ElectionTimeoutRange.END)
               timers.startSingleTimer(ElectionTimeout(), timeout.milliseconds)
 
-              // if log does not contain an entry at prevLogIndex whose term matches prevLogTerm
-              // delete the existing entry and all that follow it
-              rpc.entries.zipWithIndex.foreach { (entry, idx) =>
-                val realIdx = rpc.prevLogIndex + idx
-
-                if log.isDefinedAt(realIdx) && log(realIdx)._1 != entry._1 then
-                  context.log.info(s"$tag: Log entries do not match. Reconciling...")
-                  log = log.take(realIdx)
-              }
-
-              // append any new entries not already in the log
-              rpc.entries.zipWithIndex.foreach { (entry, idx) =>
-                val realIdx = rpc.prevLogIndex + idx
-
-                if !log.isDefinedAt(realIdx) then
-                  context.log.info(s"$tag: Appending $entry to log...")
-                  log = log.appended(entry)
-                  context.log.info(s"$tag: Log $log")
-              }
-
-              // try to update commitIndex
-              if rpc.leaderCommit > commitIndex then
-                val indexOfLastNewEntry = log.length
-                commitIndex = math.min(rpc.leaderCommit, indexOfLastNewEntry)
-
-              tryApplyCommit(context)
-
-              val isInitialLog = rpc.prevLogIndex == 0 && rpc.prevLogTerm == 0L
-              if isInitialLog || log.isDefinedAt(rpc.prevLogIndex - 1) && log(rpc.prevLogIndex - 1)._1 == rpc.prevLogTerm then
-                context.log.trace(s"$tag: Replying true since prevLogIndex and prevLogTerm match...")
-                rpc.replyTo ! AppendEntriesResponseRPC(currentTerm, success = true, id)
+              if log.isDefinedAt(rpc.prevLogIndex - 1) && log(rpc.prevLogIndex - 1)._1 != rpc.prevLogTerm then
+                rpc.replyTo ! AppendEntriesResponseRPC(currentTerm, success = false, id)
               else
-                context.log.info(s"$tag: Not the same. Log: $log, prevLogIndex=${rpc.prevLogIndex - 1}, prevLogTerm=${rpc.prevLogTerm}")
+                // if log does not contain an entry at prevLogIndex whose term matches prevLogTerm
+                // delete the existing entry and all that follow it
+
+                rpc.entries.zipWithIndex.foreach { (entry, idx) =>
+                  val realIdx = rpc.prevLogIndex + idx
+
+                  if log.isDefinedAt(realIdx) && log(realIdx)._1 != entry._1 then
+                    context.log.info(s"$tag: Log entries do not match. Reconciling...")
+                    log = log.take(realIdx)
+                }
+
+                // append any new entries not already in the log
+                rpc.entries.zipWithIndex.foreach { (entry, idx) =>
+                  val realIdx = rpc.prevLogIndex + idx
+
+                  if !log.isDefinedAt(realIdx) then
+                    context.log.info(s"$tag: Appending $entry to log...")
+                    log = log.appended(entry)
+                    context.log.info(s"$tag: Log $log")
+                }
+
+                // try to update commitIndex
+                if rpc.leaderCommit > commitIndex then
+                  val indexOfLastNewEntry = log.length
+                  commitIndex = math.min(rpc.leaderCommit, indexOfLastNewEntry)
+
+                tryApplyCommit(context)
+
+                val isInitialLog = rpc.prevLogIndex == 0 && rpc.prevLogTerm == 0L
+                if isInitialLog || log.isDefinedAt(rpc.prevLogIndex - 1) && log(rpc.prevLogIndex - 1)._1 == rpc.prevLogTerm then
+                  context.log.trace(s"$tag: Replying true since prevLogIndex and prevLogTerm match...")
+                  rpc.replyTo ! AppendEntriesResponseRPC(currentTerm, success = true, id)
+                else
+                  context.log.info(s"$tag: Not the same. Log: $log, prevLogIndex=${rpc.prevLogIndex - 1}, prevLogTerm=${rpc.prevLogTerm}")
               Behaviors.same
           case _: ElectionTimeout =>
             tryApplyCommit(context)
