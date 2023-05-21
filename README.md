@@ -35,6 +35,8 @@ Our Raft implementation has built on top of it a simple Key/Value store. These a
 - `delete <key>` - Replace `<key>` with any arbitrary string. This tells the client to send a ClientRequestRPC to delete
   the entry from the store associated with the `<key>`.
 
+- `<string>` - If the commands are none of the ones above we treat it as a NoOp and send a request anyway.
+
 #### Testing Operations Available
 
 - `kill <node_id>` - Where `0 <= node_id < num_processes`. This is used to disconnect a node from the cluster and discard transient state
