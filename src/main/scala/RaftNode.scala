@@ -107,7 +107,7 @@ case class RaftNode(id: ID) {
 
   private var leaderHint: Option[ActorRef[RaftEvent]] = None
 
-  private val stateMachine = StateMachine(id)
+  private var stateMachine = StateMachine(id)
 
   private def tryApplyCommit(context: ActorContext[RaftEvent]): Option[String | Any] = {
     if commitIndex > lastApplied then
@@ -132,6 +132,10 @@ case class RaftNode(id: ID) {
     StorageManager.serialize(votedFor, votedForFilename)
 
   def apply(): Behavior[RaftEvent] = Behaviors.setup { _ =>
+    commitIndex = 0
+    lastApplied = 0
+    leaderHint = None
+    stateMachine = StateMachine(id)
     Behaviors.receive { (context, msg) =>
       msg match {
         case init: Init =>
@@ -270,6 +274,9 @@ case class RaftNode(id: ID) {
             context.log.info(s"$tag: Election timeout occurred. Becoming a candidate...")
             timers.cancelAll()
             becomeCandidate()
+          case _: KillOp =>
+            timers.cancelAll()
+            apply()
           case _: RaftEvent =>
             Behaviors.same
         }
@@ -371,6 +378,9 @@ case class RaftNode(id: ID) {
             context.log.info(s"$tag: Election timeout occurred after receiving $votes/${nodes.length + 1}. Increasing term and restarting election...")
             timers.cancelAll()
             becomeCandidate()
+          case _: KillOp =>
+            timers.cancelAll()
+            apply()
           case _: RaftEvent =>
             Behaviors.same
         }
