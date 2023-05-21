@@ -65,9 +65,9 @@ object RaftNode {
 case class RaftNode(id: ID) {
   import RaftNode.*
 
-  val currentTermFilename = s"N$id-ct.raft"
-  val votedForFilename = s"N$id-vf.raft"
-  val logFilename = s"N$id-log.raft"
+  private val currentTermFilename = s"N$id-ct.raft"
+  private val votedForFilename = s"N$id-vf.raft"
+  private val logFilename = s"N$id-log.raft"
 
   private val tag = s"[Node $id]"
   private var nodes = List.empty[(ID, ActorRef[RaftEvent])]
@@ -197,10 +197,10 @@ case class RaftNode(id: ID) {
               if rpc.logLength >= log.length then
                 logAtLeastUpToDate = true
 
-            context.log.info(s"$tag: candidateLastLogIndex=${rpc.lastLogIndex}, candidateLastLogTerm=${rpc.lastLogTerm}, candidateLastLogLength=${rpc.logLength} " +
+            context.log.trace(s"$tag: candidateLastLogIndex=${rpc.lastLogIndex}, candidateLastLogTerm=${rpc.lastLogTerm}, candidateLastLogLength=${rpc.logLength} " +
               s"followerLastLogIndex=$lastLogIndex, followerLastLogTerm=$lastLogTerm, followerLogLength=${log.length}")
 
-            context.log.info(s"$tag: isNullOrCandidateId=$isNullOrCandidateId, logAtleastUpToDate=$logAtLeastUpToDate")
+            context.log.trace(s"$tag: isNullOrCandidateId=$isNullOrCandidateId, logAtleastUpToDate=$logAtLeastUpToDate")
             if rpc.term < currentTerm then
               // candidate is out of date. reply false
               rpc.replyTo ! RequestVoteResponseRPC(currentTerm, voteGranted = false)
