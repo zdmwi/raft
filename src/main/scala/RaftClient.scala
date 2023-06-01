@@ -37,7 +37,7 @@ case class RaftClient(id: ID, cluster: Seq[(ID, ActorRef[RaftEvent])]) {
 
     Behaviors.withTimers { timers =>
 
-      val delay = 2
+      val delay = 1
       timers.startTimerWithFixedDelay(ResponseTimeout(request), delay.seconds)
 
       Behaviors.receive { (context, msg) =>
@@ -45,7 +45,6 @@ case class RaftClient(id: ID, cluster: Seq[(ID, ActorRef[RaftEvent])]) {
           case cmd: String =>
             // parse the values
             val params = cmd.split(" ")
-            val action = params.lift(0)
             val argument = params.lift(1)
 
             var op: RaftCommand = NoOp()

@@ -48,4 +48,5 @@ Our Raft implementation has built on top of it a simple Key/Value store. These a
 
 ### Known Issues
 
-- A configuration with only one node fails because some changes are made in response to events from other nodes
+- When state is recovered from the files, the buy operations are repeated and affect the last saved state. To 
+  prevent this, please wipe the state clean before a restart. This happens because we don't persist the client 

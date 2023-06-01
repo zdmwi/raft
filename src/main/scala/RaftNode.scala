@@ -128,11 +128,7 @@ case class RaftNode(id: ID) {
   private def updateLog(context: ActorContext[RaftEvent], newLog: List[LogEntry]) =
     log = newLog
     context.log.trace(s"$tag: Updating tentative state...")
-    tentativeStateMachine.setClients(stateMachine.getClients)
-    tentativeStateMachine.setStore(stateMachine.getStore)
-
-    // apply the latest log
-    tentativeStateMachine.applyIfNotProcessed(tag, context, log.last._2)
+    tentativeStateMachine.simulate(tag, context, log)
     StorageManager.serialize(log, logFilename)
 
   private def updateCurrentTerm(newTerm: Term) =
