@@ -1,6 +1,7 @@
-## Raft Consensus Algorithm
+## Mixed Consistency Ticket Sales 
 
-This project is an implementation of the core features of the Raft Consensus Algorithm proposed in
+This project is an implementation of a Ticket Sales application that makes use of both consistent and inconsistent reads
+on top of the core features of the Raft Consensus Algorithm proposed in
 [In Search of an Understandable Consensus Algorithm](https://raft.github.io/raft.pdf) using Akka Actors.
 
 ### Usage
@@ -11,7 +12,9 @@ To run the algorithm, install [sbt](https://www.scala-sbt.org/) and execute the 
 sbt "run <number_of_nodes>"
 ```
 
-where `<number_of_processes>` is replaced by a positive integer value that is greater than 1.
+where `<number_of_nodes>` is replaced by a positive integer value that is greater than 1. For the sake of the application
+we also spawn one frontend per available node. Frontends will make unstable read requests to the nodes with matching IDs
+where the ID is just the index in the collection of nodes or collection of frontends.
 
 You can also run an sbt shell, and then just type "compile", "run", or "runMain ..." in the resulting shell.
 
@@ -22,18 +25,18 @@ Our Raft implementation has built on top of it a simple Key/Value store. These a
 
 #### Client Operations Available
 
-- `create <key> <value>` - Replace `<key>` and `<value>` with any arbitrary strings. This tells the client to
-  send a ClientRequestRPC with the command to add `<value>` to our store associated with the `<key>` provided.
+- `buy <value>` - Replace `<value>` with any positive integer. This tells the client to
+  send a ClientRequestRPC with the command to buy `<value>` amount of tickets. All this does to our state is reduce 
+  the number of remainingTickets by `<value>`.
 
-- `read <key>` - Replace `<key>` with any string. This tells the client to send a ClientQueryRPC to read a value from
-  the store using `<key>`.
+- `read` - This tells the client to make a Consistent Read by sending a ClientQueryRPC to read the latest committed 
+  ticket count from the state.
 
-- `update <key> <value>` - Replace `<key>` and `<value>` with any arbitrary strings. This tells the client to
-  send a ClientRequestRPC with the command to modify an existing entry's value associated with `<key>` to `<value>`. If
-  the entry does not exist this operation will create a new entry.
+- `unread` - This tells the client to make an Inconsistent read to its closest replica by sending an UnstableClientQueryRPC
+  to read a guess as to what the remaining ticket count is.
 
-- `delete <key>` - Replace `<key>` with any arbitrary string. This tells the client to send a ClientRequestRPC to delete
-  the entry from the store associated with the `<key>`.
+- `replenish <value>` - Replace `<value>` with any positive integer. This tells the client to replenish or add the 
+  corresponding `<value>` amount of tickets to the remaining ticket count.
 
 - `<string>` - If the commands are none of the ones above we treat it as a NoOp and send a request anyway.
 
@@ -41,8 +44,8 @@ Our Raft implementation has built on top of it a simple Key/Value store. These a
 
 - `kill <node_id>` - Where `0 <= node_id < num_processes`. This is used to disconnect a node from the cluster and discard transient state
 - `start <node_id>` - Where `0 <= node_id < num_processes`. This is used to reconnect a disconnected node to the cluster.
+- `workload` - This is used to fill the request queues of the frontends with the commands specfied in the `Main.scala` file.
 
 ### Known Issues
 
-- Only one client request can be serviced at a time.
 - A configuration with only one node fails because some changes are made in response to events from other nodes

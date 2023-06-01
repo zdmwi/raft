@@ -2,6 +2,7 @@ import RaftNode.ID
 import akka.actor.typed.scaladsl.{ActorContext, Behaviors}
 import akka.actor.typed.{ActorRef, Behavior}
 
+import scala.collection.immutable.Queue
 import scala.concurrent.duration.DurationInt
 import scala.util.Random
 import scala.util.control.Breaks
@@ -18,7 +19,7 @@ object ElectionTimeoutRange {
 object RaftNode {
   private type Term = Long
   type ID = Int
-  private type LogEntry = (Term, RaftCommand)
+  type LogEntry = (Term, RaftCommand)
 
   sealed trait RaftEvent
 
@@ -47,9 +48,9 @@ object RaftNode {
   // Client interaction RPCs
   sealed trait ClientRPC extends RPC
 
-  case class RegisterClientRPC(sequenceNum: Long, replyTo: ActorRef[RaftEvent]) extends ClientRPC
+  case class RegisterClientRPC(clientId: ID, sequenceNum: Long, replyTo: ActorRef[RaftEvent]) extends ClientRPC
 
-  case class RegisterClientResponseRPC(status: ClientRPCStatus, clientId: ID, leaderHint: Option[ActorRef[RaftEvent]]) extends ClientRPC
+  case class RegisterClientResponseRPC(status: ClientRPCStatus, leaderHint: Option[ActorRef[RaftEvent]]) extends ClientRPC
 
   case class ClientRequestRPC(clientId: ID, sequenceNum: Long, command: RaftCommand, replyTo: ActorRef[RaftEvent]) extends ClientRPC
 
@@ -57,8 +58,11 @@ object RaftNode {
 
   case class ClientQueryRPC(query: RaftCommand, replyTo: ActorRef[RaftEvent]) extends ClientRPC
 
+  case class UnstableClientQueryRPC(query: RaftCommand, replyTo: ActorRef[RaftEvent]) extends ClientRPC
+
   case class ClientQueryResponseRPC(status: ClientRPCStatus, response: Any, leaderHint: Option[ActorRef[RaftEvent]]) extends ClientRPC
 
+  case class UnstableClientQueryResponseRPC(status: ClientRPCStatus, response: Any, leaderHint: Option[ActorRef[RaftEvent]]) extends ClientRPC
   trait RaftCommand extends RaftEvent
 }
 
@@ -108,19 +112,27 @@ case class RaftNode(id: ID) {
   private var leaderHint: Option[ActorRef[RaftEvent]] = None
 
   private var stateMachine = StateMachine(id)
+  private var tentativeStateMachine = StateMachine(id, false, false) // this state machine will have the state for uncommitted entries
 
+  private var requestQueue = Queue.empty[(String, ActorRef[RaftEvent], Option[RaftEvent])]
   private def tryApplyCommit(context: ActorContext[RaftEvent]): Option[String | Any] = {
     if commitIndex > lastApplied then
       lastApplied += 1
       val command = log(lastApplied - 1)._2
-      context.log.info(s"$tag: Applying command $command to state machine...")
+      context.log.trace(s"$tag: Applying command $command to state machine...")
       return stateMachine.applyIfNotProcessed(tag, context, command)
 
     None
   }
 
-  private def updateLog(newLog: List[LogEntry]) =
+  private def updateLog(context: ActorContext[RaftEvent], newLog: List[LogEntry]) =
     log = newLog
+    context.log.trace(s"$tag: Updating tentative state...")
+    tentativeStateMachine.setClients(stateMachine.getClients)
+    tentativeStateMachine.setStore(stateMachine.getStore)
+
+    // apply the latest log
+    tentativeStateMachine.applyIfNotProcessed(tag, context, log.last._2)
     StorageManager.serialize(log, logFilename)
 
   private def updateCurrentTerm(newTerm: Term) =
@@ -131,11 +143,27 @@ case class RaftNode(id: ID) {
     votedFor = newVotedFor
     StorageManager.serialize(votedFor, votedForFilename)
 
+  private def respondToUnstableReadRequest(context: ActorContext[RaftEvent], rpc: UnstableClientQueryRPC): Unit =
+    // all nodes can respond to an unstable query so we try to service it with our tentative state
+    context.log.info(s"$tag: Received $rpc from client. Reading from application...")
+
+    // read the response from the tentative state
+    if log.isEmpty then
+      context.log.info(s"$tag: Log is empty. Indicating to client...")
+      // we use a None response to indicate that the log is empty
+      rpc.replyTo ! UnstableClientQueryResponseRPC(status = ClientRPCStatus.NOT_LEADER, None, leaderHint)
+    else
+      context.log.trace(s"$tag: Sending response to client from tentative state...")
+
+      val result = tentativeStateMachine.applyIfNotProcessed(tag, context, rpc.query)
+      rpc.replyTo ! UnstableClientQueryResponseRPC(ClientRPCStatus.NOT_LEADER, result, leaderHint)
+
   def apply(): Behavior[RaftEvent] = Behaviors.setup { _ =>
     commitIndex = 0
     lastApplied = 0
     leaderHint = None
     stateMachine = StateMachine(id)
+    tentativeStateMachine = StateMachine(id, false, false)
     Behaviors.receive { (context, msg) =>
       msg match {
         case init: Init =>
@@ -161,7 +189,7 @@ case class RaftNode(id: ID) {
           case rpc: RegisterClientRPC =>
             // if we get any messages from a client, redirect them to the leader or who we think it is at least
             context.log.info(s"$tag: Received request from client. Redirecting to leader...")
-            rpc.replyTo ! RegisterClientResponseRPC(ClientRPCStatus.NOT_LEADER, -1, leaderHint)
+            rpc.replyTo ! RegisterClientResponseRPC(ClientRPCStatus.NOT_LEADER, leaderHint)
             Behaviors.same
           case rpc: ClientRequestRPC =>
             // redirect them to who we think the leader is
@@ -172,6 +200,9 @@ case class RaftNode(id: ID) {
             // redirect them to who we think the leader is
             context.log.info(s"$tag: Received request from client. Redirecting to leader...")
             rpc.replyTo ! ClientQueryResponseRPC(ClientRPCStatus.NOT_LEADER, -1, leaderHint)
+            Behaviors.same
+          case rpc: UnstableClientQueryRPC =>
+            respondToUnstableReadRequest(context, rpc)
             Behaviors.same
           case rpc: RequestVoteRPC =>
             if rpc.term > currentTerm then
@@ -241,7 +272,7 @@ case class RaftNode(id: ID) {
 
                   if log.isDefinedAt(realIdx) && log(realIdx)._1 != entry._1 then
                     context.log.info(s"$tag: Log entries do not match. Reconciling...")
-                    updateLog(log.take(realIdx))
+                    updateLog(context, log.take(realIdx))
                 }
 
                 // append any new entries not already in the log
@@ -249,9 +280,9 @@ case class RaftNode(id: ID) {
                   val realIdx = rpc.prevLogIndex + idx
 
                   if !log.isDefinedAt(realIdx) then
-                    context.log.info(s"$tag: Appending $entry to log...")
-                    updateLog(log.appended(entry))
-                    context.log.info(s"$tag: Log $log")
+                    context.log.trace(s"$tag: Appending $entry to log...")
+                    updateLog(context, log.appended(entry))
+                    context.log.trace(s"$tag: Log $log")
                 }
 
                 // try to update commitIndex
@@ -305,7 +336,7 @@ case class RaftNode(id: ID) {
       val lastLogTerm = log.lastOption.map(_._1).getOrElse(0L)
       nodes.foreach { (nodeId, node) =>
         val rpc = RequestVoteRPC(currentTerm, id, lastLogIndex, lastLogTerm, log.length, context.self)
-        context.log.info(s"$tag: Sending RequestVoteRPC $rpc to [Node $nodeId)}")
+        context.log.info(s"$tag: Sending RequestVoteRPC $rpc to [Node $nodeId]")
         node ! rpc
       }
 
@@ -313,7 +344,7 @@ case class RaftNode(id: ID) {
         msg match {
           case rpc: RegisterClientRPC =>
             context.log.info(s"$tag: Received request from client. Redirecting to leader...")
-            rpc.replyTo ! RegisterClientResponseRPC(ClientRPCStatus.NOT_LEADER, -1, leaderHint)
+            rpc.replyTo ! RegisterClientResponseRPC(ClientRPCStatus.NOT_LEADER, leaderHint)
             Behaviors.same
           case rpc: ClientRequestRPC =>
             context.log.info(s"$tag: Received request from client. Redirecting to leader...")
@@ -323,6 +354,9 @@ case class RaftNode(id: ID) {
             // redirect them to who we think the leader is
             context.log.info(s"$tag: Received request from client. Redirecting to leader...")
             rpc.replyTo ! ClientQueryResponseRPC(ClientRPCStatus.NOT_LEADER, -1, leaderHint)
+            Behaviors.same
+          case rpc: UnstableClientQueryRPC =>
+            respondToUnstableReadRequest(context, rpc)
             Behaviors.same
           case rpc: AppendEntriesRPC =>
             tryApplyCommit(context)
@@ -393,9 +427,6 @@ case class RaftNode(id: ID) {
 
     leaderHint = Some(context.self)
 
-    // keep track of pending requests
-    var pendingResponseRPC: Option[(ActorRef[RaftEvent], RaftEvent)] = None
-
     // Volatile state
     val nextIndex: Array[Int] = Array.fill(nodes.length + 1) {
       log.length + 1
@@ -409,16 +440,16 @@ case class RaftNode(id: ID) {
       (0, List.empty[LogEntry])
     }
 
-    var needsToCommit = false
+    var readIndex: Option[Int] = None
     var replicatedCount = 0
 
     // client interaction requirement, upon becoming leader append NoOp entry to log
-    context.log.info(s"$tag: Appending NoOp to log...")
-    updateLog(log.appended((currentTerm, NoOp())))
-    context.log.info(s"$tag: Log is $log")
+    // this helps us to know which entries have been committed at the start of the leader's term
+    context.log.trace(s"$tag: Appending NoOp to log...")
+    updateLog(context, log.appended((currentTerm, NoOp())))
+    context.log.trace(s"$tag: Log is $log")
 
     // track state of replications so far while we need to commit
-    needsToCommit = true
     replicatedCount += 1
 
     def tryUpdateCommitIndex(context: ActorContext[RaftEvent]): Unit = {
@@ -472,36 +503,37 @@ case class RaftNode(id: ID) {
       Behaviors.receive { (context, msg) =>
         msg match {
           case rpc: RegisterClientRPC =>
-            val clientID = log.length - 1
-            val command = RegisterOp(rpc.sequenceNum, 0)
-            context.log.info(s"$tag: Received $rpc from client. Appending $command to log...")
-            updateLog(log.appended((currentTerm, command)))
-            context.log.info(s"$tag: Log $log")
-            needsToCommit = true
+            val command = RegisterOp(rpc.sequenceNum, rpc.clientId)
+            context.log.info(s"$tag: Received $rpc from client...")
+            context.log.trace(s"$tag: Appending $command to log...")
+            updateLog(context, log.appended((currentTerm, command)))
+            context.log.trace(s"$tag: Log $log")
 
-            val res = RegisterClientResponseRPC(ClientRPCStatus.OK, clientID, leaderHint)
-            pendingResponseRPC = Some((rpc.replyTo, res))
+            // add the request to the request queue
+            val res = RegisterClientResponseRPC(ClientRPCStatus.OK, leaderHint)
+            requestQueue = requestQueue.enqueue(("register", rpc.replyTo, Some(res))).distinct
 
             Behaviors.same
           case rpc: ClientRequestRPC =>
             context.log.info(s"$tag: Received $rpc from client. Appending ${rpc.command} to log...")
-            updateLog(log.appended((currentTerm, rpc.command)))
-            context.log.info(s"$tag: Log $log")
-            needsToCommit = true
+            updateLog(context, log.appended((currentTerm, rpc.command)))
+            context.log.trace(s"$tag: Log $log")
 
             val res = ClientRequestResponseRPC(ClientRPCStatus.OK, None, leaderHint)
-            pendingResponseRPC = Some((rpc.replyTo, res))
+            requestQueue = requestQueue.enqueue(("request", rpc.replyTo, Some(res))).distinct
 
             Behaviors.same
           case rpc: ClientQueryRPC =>
             context.log.info(s"$tag: Received $rpc from client. Reading from application...")
 
-            // TODO: implement the receiver steps how it was specified in ClientRPC. For now we assume that we
-            // are always up to date (though this is wrong)
+            // save the current commitIndex in a local variable called readIndex. This will be used
+            // as the lower bound for the version of the state that the query operates against
+            readIndex = Some(commitIndex)
 
-            val result = stateMachine.applyIfNotProcessed(tag, context, rpc.query)
-            rpc.replyTo !  ClientQueryResponseRPC(ClientRPCStatus.OK, result, leaderHint)
-
+            requestQueue = requestQueue.enqueue(("read", rpc.replyTo, None)).distinct
+            Behaviors.same
+          case rpc: UnstableClientQueryRPC =>
+            respondToUnstableReadRequest(context, rpc)
             Behaviors.same
           case rpc: RequestVoteRPC =>
             tryApplyCommit(context)
@@ -532,39 +564,51 @@ case class RaftNode(id: ID) {
                 val indexAndEntry = prevIndexEntriesSent(rpc.followerId)
                 val prevIndex = indexAndEntry._1
                 val prevEntries = indexAndEntry._2
-                context.log.trace(s"$tag: MatchIndex before update - ${matchIndex.mkString(",")}")
-                context.log.trace(s"$tag: NextIndex before update - ${nextIndex.mkString(",")}")
                 matchIndex(rpc.followerId) = prevIndex + prevEntries.length
 
                 if matchIndex(rpc.followerId) >= nextIndex(rpc.followerId) then
                   nextIndex(rpc.followerId) = matchIndex(rpc.followerId) + 1
 
-                context.log.trace(s"$tag: MatchIndex after update - ${matchIndex.mkString(",")}")
-                context.log.trace(s"$tag: NextIndex after update - ${nextIndex.mkString(",")}")
-
-                if needsToCommit then
-                  replicatedCount += 1
+                replicatedCount += 1
 
                 val majority = math.ceil((nodes.length + 1) / 2)
                 if replicatedCount > majority then
-                  context.log.info(s"$tag: $replicatedCount/${nodes.length + 1} have replicated the entry. It is safe to commit.")
+                  context.log.trace(s"$tag: $replicatedCount/${nodes.length + 1} have replicated the entry. It is safe to commit.")
 
                   // it is safe to commit so reset the count and try to update the commitIndex
-                  replicatedCount = 0
-                  needsToCommit = false
                   tryUpdateCommitIndex(context)
-                  // ideally we have a way to update the response in the pending response to
-                  // the result from committing. Fix for part 3.
                   tryApplyCommit(context)
+                  replicatedCount = 0
 
-                  if pendingResponseRPC.isDefined then
-                    val replyTo = pendingResponseRPC.get._1
-                    val rpc = pendingResponseRPC.get._2
+                  if requestQueue.nonEmpty then
+                    val (pendingRequest, updatedQueue) = requestQueue.dequeue
+                    requestQueue = updatedQueue
 
-                    context.log.info(s"$tag: Sending reply to $replyTo...")
-                    replyTo ! rpc
+                    val reqType = pendingRequest._1
+                    val replyTo = pendingRequest._2
+                    var res = pendingRequest._3
+
+                    // if this is a read request, we know that we are still the leader since we received
+                    // the majority of responses, therefore readIndex (set where we respond to ClientQueryRPC), was,
+                    // at the time the largest commitIndex ever seen by any server in the cluster
+                    if reqType == "read" then
+                      // we wait for the state machine to advance at least as far as readIndex which is enough to satisfy
+                      // linearizability
+                      if lastApplied >= readIndex.get then
+                        // finally read the state from the state machine and return the response
+                        context.log.info(s"$tag: Sending read reply to $replyTo...")
+                        val read = stateMachine.applyIfNotProcessed(tag, context, ReadOp())
+                        res = Some(ClientQueryResponseRPC(ClientRPCStatus.OK, read, leaderHint))
+                        replyTo ! res.get
+                      else
+                        // add it back to the queue
+                        requestQueue = requestQueue.enqueue(pendingRequest).distinct
+                    else
+                      context.log.info(s"$tag: Sending request reply to $replyTo...")
+                      replyTo ! res.get
                   else
-                    context.log.info(s"$tag: No requests to respond to")
+                    // No requests then it is just a heartbeat
+                    context.log.trace(s"$tag: No requests to respond to")
               else
                 // decrement nextIndex. RPC will be retried on the next heartbeat
                 nextIndex(rpc.followerId) -= 1

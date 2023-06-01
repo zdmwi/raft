@@ -1,7 +1,8 @@
-import RaftNode.{ID, RaftEvent}
+import RaftNode.{ID, RaftCommand, RaftEvent}
 import akka.actor.typed.scaladsl.Behaviors
 import akka.actor.typed.{ActorRef, Behavior}
 
+import scala.collection.immutable.Queue
 import scala.concurrent.duration.DurationInt
 import scala.util.Random
 
@@ -9,18 +10,20 @@ object RaftClient {
   sealed trait ClientEvent
   private case class ResponseTimeout(rpc: Any) extends ClientEvent
 }
-case class RaftClient(cluster: Seq[(ID, ActorRef[RaftEvent])]) {
+case class RaftClient(id: ID, cluster: Seq[(ID, ActorRef[RaftEvent])]) {
   import RaftClient.*
   import RaftNode.*
 
-  private val tag = "[Client]"
+  private val tag = s"[Client $id]"
   // randomly choose a node from the cluster as the leader
   private var leaderHint: Option[ActorRef[RaftEvent]] = None
   private var leaderAddr: ActorRef[RaftEvent] = Random.shuffle(cluster).head._2
 
-  private var clientId: Option[ID] = None
+  // select the node with the matching id to be the favored unstable read replica
+  private val readReplica = cluster(id)._2
 
   private var request: Option[RaftEvent] = None
+  private var recipient: Option[ActorRef[RaftEvent]] = None
 
   private var sequenceNum = 0L
 
@@ -29,12 +32,12 @@ case class RaftClient(cluster: Seq[(ID, ActorRef[RaftEvent])]) {
 
     context.log.info("Registering with the Raft cluster...")
     // Client must register with the cluster
-    request = Some(RegisterClientRPC(sequenceNum, context.self)) // if just registering sequence num must always be 0
+    request = Some(RegisterClientRPC(id, sequenceNum, context.self)) // if just registering sequence num must always be 0
     leaderAddr ! request.get
 
     Behaviors.withTimers { timers =>
 
-      val delay = 1
+      val delay = 2
       timers.startTimerWithFixedDelay(ResponseTimeout(request), delay.seconds)
 
       Behaviors.receive { (context, msg) =>
@@ -42,29 +45,35 @@ case class RaftClient(cluster: Seq[(ID, ActorRef[RaftEvent])]) {
           case cmd: String =>
             // parse the values
             val params = cmd.split(" ")
-            val key = params.lift(1)
-            val value = params.lift(2)
+            val action = params.lift(0)
+            val argument = params.lift(1)
 
             var op: RaftCommand = NoOp()
-            if clientId.isDefined then
-              context.log.info(s"$tag: Sending request...")
-              // parse the command and forward it to the cluster
-              if cmd.startsWith("read") then
-                context.log.info(s"$tag: Requesting read of key $key...")
-                request = Some(ClientQueryRPC(ReadOp(key.get), context.self))
-              else
-                if cmd.startsWith("create") then
-                  op = CreateOp(key.get, value.get, sequenceNum, clientId.get)
-                else if cmd.startsWith("delete") then
-                  op = DeleteOp(key.get, sequenceNum, clientId.get)
-                else if cmd.startsWith("update") then
-                  op = UpdateOp(key.get, value.get, sequenceNum, clientId.get)
-                else
-                  op = NoOp()
-                request = Some(ClientRequestRPC(clientId.get, sequenceNum, op, context.self))
+            context.log.trace(s"$tag: Sending request...")
 
-              leaderAddr ! request.get
-              timers.startTimerWithFixedDelay(ResponseTimeout(request), delay.seconds)
+            recipient = Some(leaderAddr)
+            // parse the command and forward it to the cluster
+            if cmd.startsWith("read") then
+              context.log.info(s"$tag: Requesting read...")
+              request = Some(ClientQueryRPC(ReadOp(), context.self))
+            else if cmd.startsWith("unread") then
+              context.log.info(s"$tag: Requesting unstable read...")
+              request = Some(UnstableClientQueryRPC(ReadOp(), context.self))
+              recipient = Some(readReplica)
+            else if cmd.startsWith("buy") then
+              context.log.info(s"$tag: Buying ${argument.get} tickets...")
+              op = BuyOp(argument.get.toInt, sequenceNum, id)
+              request = Some(ClientRequestRPC(id, sequenceNum, op, context.self))
+            else if cmd.startsWith("replenish") then
+              context.log.info(s"$tag: Replenishing ${argument.get} tickets...")
+              op = ReplenishOp(argument.get.toInt, sequenceNum, id)
+              request = Some(ClientRequestRPC(id, sequenceNum, op, context.self))
+            else
+              op = NoOp()
+              request = Some(ClientRequestRPC(id, sequenceNum, op, context.self))
+
+            recipient.get ! request.get
+            timers.startTimerWithFixedDelay(ResponseTimeout(request), delay.seconds)
             Behaviors.same
           case rpc: ClientQueryResponseRPC =>
             if rpc.status == ClientRPCStatus.OK then
@@ -75,6 +84,12 @@ case class RaftClient(cluster: Seq[(ID, ActorRef[RaftEvent])]) {
             else if rpc.status == ClientRPCStatus.NOT_LEADER then
               if rpc.leaderHint.isDefined then
                 leaderHint = rpc.leaderHint
+            Behaviors.same
+          case rpc: UnstableClientQueryResponseRPC =>
+            context.log.info(s"$tag: Received unstable read response: ${rpc.response}")
+            timers.cancelAll()
+            leaderHint = rpc.leaderHint
+            request = None
             Behaviors.same
           case rpc: ClientRequestResponseRPC =>
             if rpc.status == ClientRPCStatus.OK then
@@ -89,7 +104,6 @@ case class RaftClient(cluster: Seq[(ID, ActorRef[RaftEvent])]) {
                 leaderHint = rpc.leaderHint
             else if rpc.status == ClientRPCStatus.OK then
               timers.cancelAll()
-              clientId = Some(rpc.clientId)
               leaderAddr = rpc.leaderHint.get
               request = None
               sequenceNum += 1

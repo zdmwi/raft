@@ -10,7 +10,14 @@ import scala.io.StdIn.readLine
     node ! Init(cluster.filter(_._1 != id))
   }
 
-  val client = ActorSystem(RaftClient(cluster)(), "C")
+  val frontends = for (i <- 0 until numNodes) yield ActorSystem(RaftClient(i, cluster)(), s"C$i")
+
+  val workloads = Map(
+    1 -> Seq("buy 1", "buy 2", "buy 1", "unread", "read"),
+    2 -> Seq("buy 1", "buy 2", "buy 3"),
+    3 -> Seq("buy 4", "buy 1", "buy 1"),
+    4 -> Seq("buy 2", "buy 1", "buy 2")
+  )
 
   var done = false
   while !done do
@@ -19,7 +26,8 @@ import scala.io.StdIn.readLine
       cluster.foreach { (_, node) =>
         node.terminate()
       }
-      client.terminate()
+
+      frontends.foreach { _.terminate() }
       done = true
     else
       var cmd: RaftEvent = NoOp()
@@ -32,7 +40,12 @@ import scala.io.StdIn.readLine
         val id = input.split(" ")(1).toInt
         cmd = Init(cluster.filter(_._1 != id))
         cluster(id)._2 ! cmd
+      else if input.startsWith("workload") then
+        // send requests
+        for (id, requests) <- workloads do {
+          requests.foreach { request => frontends(id) ! request }
+        }
       else
-        println(input)
-        client ! input
+        // run all the requests
+        frontends(0) ! input
 }
